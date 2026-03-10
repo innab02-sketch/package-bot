@@ -3,13 +3,17 @@
 """
 בוט טלגרם לניהול חבילות מהודעות SMS
 ======================================
-הבוט מקבל הודעות SMS (דרך Tasker) עם מידע על חבילות,
-שומר אותן במסד נתונים, ושולח תזכורות כל 3 ימים.
+הבוט מקבל הודעות SMS דרך שני ערוצים:
+  1. Endpoint HTTP  POST /api/sms  (מ-Tasker ישירות)
+  2. הודעות טקסט בצ'אט (forward ידני)
 
-IMPORTANT: The bot token is read from the BOT_TOKEN environment variable.
-           Set it in Railway -> Variables -> BOT_TOKEN
+Environment variables:
+  BOT_TOKEN   - Telegram bot token (required)
+  GROUP_CHAT_ID - Telegram group chat ID to send packages to (required)
+  PORT        - HTTP server port (default: 8080)
 """
 
+import asyncio
 import logging
 import sqlite3
 import os
@@ -18,6 +22,8 @@ import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
+
+from aiohttp import web
 
 from telegram import (
     Update,
@@ -36,27 +42,33 @@ from telegram.error import TelegramError
 
 # ─── הגדרות ───────────────────────────────────────────────────────────────────
 
-# Token is ALWAYS read from environment variable - never hardcoded
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-
 if not BOT_TOKEN:
-    print("FATAL ERROR: BOT_TOKEN environment variable is not set!", file=sys.stderr)
-    print("Set it in Railway -> Variables -> BOT_TOKEN", file=sys.stderr)
+    print("FATAL: BOT_TOKEN environment variable is not set!", file=sys.stderr)
     sys.exit(1)
 
-# תדירות תזכורות בשניות (3 ימים = 259200 שניות)
-REMINDER_INTERVAL_SECONDS = 3 * 24 * 60 * 60  # 259200
+# Group chat ID where packages are announced (set via env var or /start command)
+GROUP_CHAT_ID_ENV = os.environ.get("GROUP_CHAT_ID")
 
-# נתיב מסד הנתונים
+# HTTP server port
+PORT = int(os.environ.get("PORT", "8080"))
+
+# Reminder interval: 3 days
+REMINDER_INTERVAL_SECONDS = 3 * 24 * 60 * 60
+
+# DB path
 DB_PATH = Path(__file__).parent / "packages.db"
 
-# הגדרת לוגים - stdout so Railway captures them
+# Logging to stdout so Railway captures it
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
     stream=sys.stdout,
 )
 logger = logging.getLogger(__name__)
+
+# Global reference to the bot Application (set in main)
+_app: Application = None
 
 # ─── מסד נתונים ──────────────────────────────────────────────────────────────
 
@@ -92,8 +104,10 @@ def add_package(chat_id, sms_text, sender="", tracking_number=""):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO packages (chat_id, sms_text, sender, tracking_number, added_date) VALUES (?,?,?,?,?)",
-        (chat_id, sms_text, sender, tracking_number, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        "INSERT INTO packages (chat_id, sms_text, sender, tracking_number, added_date) "
+        "VALUES (?,?,?,?,?)",
+        (chat_id, sms_text, sender, tracking_number,
+         datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
     )
     package_id = cursor.lastrowid
     conn.commit()
@@ -155,14 +169,26 @@ def add_authorized_chat(chat_id, chat_title=""):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT OR IGNORE INTO authorized_chats (chat_id, chat_title, added_date) VALUES (?,?,?)",
+        "INSERT OR IGNORE INTO authorized_chats (chat_id, chat_title, added_date) "
+        "VALUES (?,?,?)",
         (chat_id, chat_title, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
     )
     conn.commit()
     conn.close()
 
 
-# ─── עזר: חילוץ מידע מ-SMS ─────────────────────────────────────────────────
+def get_primary_chat_id():
+    """Return GROUP_CHAT_ID env var (if set) or the first registered chat."""
+    if GROUP_CHAT_ID_ENV:
+        try:
+            return int(GROUP_CHAT_ID_ENV)
+        except ValueError:
+            pass
+    chats = get_authorized_chats()
+    return chats[0] if chats else None
+
+
+# ─── SMS processing (shared logic) ───────────────────────────────────────────
 
 def extract_tracking_info(text):
     info = {"sender": "", "tracking_number": ""}
@@ -189,6 +215,124 @@ def extract_tracking_info(text):
     return info
 
 
+async def process_sms_and_notify(sms_text: str, chat_id: int, sender_label: str = ""):
+    """
+    Core logic: save package to DB and send a notification to the group.
+    Called both from the HTTP endpoint and from the Telegram message handler.
+    """
+    global _app
+    info = extract_tracking_info(sms_text)
+    if sender_label:
+        info["sender"] = sender_label
+
+    package_id = add_package(chat_id, sms_text, info["sender"], info["tracking_number"])
+    logger.info("Package #%s registered for chat %s", package_id, chat_id)
+
+    confirm = f"📦 חבילה חדשה נרשמה! (#{package_id})\n\n{sms_text}"
+    if info["sender"]:
+        confirm += f"\nשולח: {info['sender']}"
+    if info["tracking_number"]:
+        confirm += f"\nמספר מעקב: {info['tracking_number']}"
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("נאספה!", callback_data=f"collect_{package_id}"),
+            InlineKeyboardButton("עדיין לא", callback_data=f"keep_{package_id}"),
+        ]
+    ])
+
+    await _app.bot.send_message(
+        chat_id=chat_id,
+        text=confirm,
+        reply_markup=keyboard,
+    )
+    return package_id
+
+
+# ─── aiohttp HTTP server ──────────────────────────────────────────────────────
+
+async def handle_sms_api(request: web.Request) -> web.Response:
+    """
+    POST /api/sms
+    Accepts JSON:  {"text": "...", "sender": "...", "chat_id": -123}
+    Or form data:  text=...&sender=...&chat_id=...
+
+    'chat_id' is optional - falls back to GROUP_CHAT_ID env var or first registered chat.
+    'sender' is optional.
+    """
+    try:
+        content_type = request.content_type or ""
+        if "application/json" in content_type:
+            data = await request.json()
+        else:
+            # form-encoded or plain POST
+            data = await request.post()
+            data = dict(data)
+
+        sms_text = data.get("text", "").strip()
+        sender_label = data.get("sender", "").strip()
+
+        if not sms_text:
+            return web.json_response(
+                {"ok": False, "error": "Missing 'text' field"}, status=400
+            )
+
+        # Determine target chat
+        raw_chat = data.get("chat_id")
+        if raw_chat:
+            try:
+                chat_id = int(raw_chat)
+            except (ValueError, TypeError):
+                return web.json_response(
+                    {"ok": False, "error": "Invalid chat_id"}, status=400
+                )
+        else:
+            chat_id = get_primary_chat_id()
+
+        if not chat_id:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": (
+                        "No chat_id provided and no registered chat found. "
+                        "Send /start in your group first, or set GROUP_CHAT_ID env var."
+                    ),
+                },
+                status=400,
+            )
+
+        # Register the chat if not already known
+        add_authorized_chat(chat_id)
+
+        logger.info(
+            "[/api/sms] Received SMS for chat %s | sender='%s' | text='%s'",
+            chat_id, sender_label, sms_text[:80],
+        )
+
+        package_id = await process_sms_and_notify(sms_text, chat_id, sender_label)
+
+        return web.json_response(
+            {"ok": True, "package_id": package_id, "chat_id": chat_id}
+        )
+
+    except Exception as e:
+        logger.error("[/api/sms] Error: %s", e, exc_info=True)
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
+async def handle_health(request: web.Request) -> web.Response:
+    """GET / - health check so Railway knows the service is up."""
+    return web.json_response({"status": "ok", "bot": "package-bot"})
+
+
+def build_web_app() -> web.Application:
+    app = web.Application()
+    app.router.add_get("/", handle_health)
+    app.router.add_get("/health", handle_health)
+    app.router.add_post("/api/sms", handle_sms_api)
+    return app
+
+
 # ─── Error handler ────────────────────────────────────────────────────────────
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -203,7 +347,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             pass
 
 
-# ─── פקודות הבוט ─────────────────────────────────────────────────────────────
+# ─── Telegram command handlers ────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -214,9 +358,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "📦 ברוכים הבאים לבוט ניהול חבילות!\n\n"
         "הבוט עוזר לכם לעקוב אחרי חבילות שמגיעות אליכם.\n\n"
-        "🔹 הודעות SMS עם מידע על חבילות יועברו לכאן דרך Tasker\n"
-        "🔹 כל 3 ימים תקבלו תזכורת על חבילות שטרם נאספו\n"
-        "🔹 ניתן לסמן חבילה כנאספה בלחיצת כפתור\n\n"
+        "שליחת SMS מ-Tasker:\n"
+        "  POST <Railway URL>/api/sms\n"
+        "  Body: {\"text\": \"...\", \"chat_id\": " + str(chat_id) + "}\n\n"
         "פקודות זמינות:\n"
         "/pending - חבילות שממתינות לאיסוף\n"
         "/all - כל החבילות\n"
@@ -224,7 +368,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/remind - תזכורת עכשיו\n"
         "/stats - סטטיסטיקות\n"
         "/help - עזרה\n\n"
-        f"Chat ID: {chat_id}"
+        f"Chat ID של הצ'אט הזה: {chat_id}"
     )
     await update.message.reply_text(text)
     logger.info("[/start] reply sent to chat_id=%s", chat_id)
@@ -235,18 +379,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("[/help] chat_id=%s", chat_id)
     text = (
         "📦 עזרה - בוט ניהול חבילות\n\n"
-        "איך זה עובד?\n"
-        "1. Tasker מזהה הודעות SMS עם המילה 'חבילה'\n"
-        "2. ההודעה נשלחת אוטומטית לבוט\n"
-        "3. הבוט שומר את המידע ומתזכר אתכם כל 3 ימים\n"
-        "4. כשהחבילה נאספה - לוחצים על הכפתור\n\n"
+        "Tasker שולח POST ל: <Railway URL>/api/sms\n"
+        "Body (JSON): {\"text\": \"תוכן ה-SMS\", \"chat_id\": <מזהה הקבוצה>}\n\n"
         "פקודות:\n"
         "/pending - חבילות שממתינות\n"
         "/all - כל החבילות\n"
         "/add טקסט - הוספה ידנית\n"
         "/remind - תזכורת עכשיו\n"
         "/stats - סטטיסטיקות\n\n"
-        "טיפ: ניתן גם להעביר (forward) הודעות SMS ישירות לצ'אט הזה"
+        "ניתן גם להעביר (forward) הודעות SMS ישירות לצ'אט הזה."
     )
     await update.message.reply_text(text)
 
@@ -273,7 +414,7 @@ async def cmd_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = [f"📦 כל החבילות ({len(packages)} אחרונות):\n"]
     for pkg in packages:
-        pkg_id, sms_text, sender, tracking, added_date, collected, collected_date, collected_by = pkg
+        pkg_id, sms_text, sender, tracking, added_date, collected, _, collected_by = pkg
         status = "נאספה" if collected else "ממתינה"
         date_short = added_date[:10] if added_date else "?"
         line = f"{'✅' if collected else '⏳'} #{pkg_id} | {date_short} | {status}\n  {sms_text[:60]}"
@@ -292,9 +433,8 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     sms_text = " ".join(context.args)
-    info = extract_tracking_info(sms_text)
-    package_id = add_package(chat_id, sms_text, info["sender"], info["tracking_number"])
-    await update.message.reply_text(f"חבילה #{package_id} נוספה בהצלחה!\n\n{sms_text}")
+    add_authorized_chat(chat_id, update.effective_chat.title or "")
+    package_id = await process_sms_and_notify(sms_text, chat_id)
     logger.info("[/add] package #%s added in chat %s", package_id, chat_id)
 
 
@@ -324,44 +464,32 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ─── טיפול בהודעות SMS (מ-Tasker) ───────────────────────────────────────────
+# ─── Plain-text message handler (manual forward from Tasker or user) ──────────
 
 async def handle_sms_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Handle plain-text messages forwarded from Tasker.
+    Handle plain-text messages forwarded manually.
     NOTE: In groups this only fires if Group Privacy is OFF in BotFather.
-    To disable: BotFather -> /mybots -> Bot Settings -> Group Privacy -> Turn off
+    The primary SMS path is now POST /api/sms.
     """
     chat_id = update.effective_chat.id
     text = update.message.text
     if not text:
         return
 
-    logger.info("[sms_handler] chat_id=%s text_preview='%s'", chat_id, text[:60])
+    logger.info("[msg_handler] chat_id=%s text='%s'", chat_id, text[:60])
 
     package_keywords = ["חבילה", "משלוח", "delivery", "package", "shipment", "הזמנה", "דואר"]
     if not any(kw in text.lower() for kw in package_keywords):
-        logger.info("[sms_handler] No package keywords - ignoring")
+        logger.info("[msg_handler] No package keywords - ignoring")
         return
 
     add_authorized_chat(chat_id, update.effective_chat.title or "")
-    info = extract_tracking_info(text)
-    package_id = add_package(chat_id, text, info["sender"], info["tracking_number"])
-
-    confirm = f"📦 חבילה חדשה נרשמה! (#{package_id})\n\n{text}"
-    if info["sender"]:
-        confirm += f"\nשולח: {info['sender']}"
-    if info["tracking_number"]:
-        confirm += f"\nמספר מעקב: {info['tracking_number']}"
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("נאספה!", callback_data=f"collect_{package_id}")]
-    ])
-    await update.message.reply_text(confirm, reply_markup=keyboard)
-    logger.info("[sms_handler] package #%s registered in chat %s", package_id, chat_id)
+    package_id = await process_sms_and_notify(text, chat_id)
+    logger.info("[msg_handler] package #%s registered via direct message", package_id)
 
 
-# ─── טיפול בלחיצות כפתור ────────────────────────────────────────────────────
+# ─── Callback handler ─────────────────────────────────────────────────────────
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -386,7 +514,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("החבילה נשארת ברשימת ההמתנה", show_alert=False)
 
 
-# ─── תזכורות ─────────────────────────────────────────────────────────────────
+# ─── Reminders ────────────────────────────────────────────────────────────────
 
 async def send_reminder_to_chat(chat_id, context):
     packages = get_pending_packages(chat_id)
@@ -436,58 +564,86 @@ async def scheduled_reminder(context: ContextTypes.DEFAULT_TYPE):
         except TelegramError as e:
             logger.error("Telegram error for chat %s: %s", chat_id, e)
         except Exception as e:
-            logger.error("Unexpected error for chat %s: %s", chat_id, e, exc_info=True)
+            logger.error("Error for chat %s: %s", chat_id, e, exc_info=True)
 
 
-# ─── הפעלת הבוט ─────────────────────────────────────────────────────────────
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
-def main():
+async def run_web_server(web_app: web.Application):
+    """Run the aiohttp web server."""
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+    await site.start()
+    logger.info("HTTP server listening on 0.0.0.0:%d", PORT)
+    logger.info("SMS endpoint: POST http://0.0.0.0:%d/api/sms", PORT)
+    return runner
+
+
+async def main_async():
+    global _app
+
     logger.info("=" * 60)
     logger.info("Starting Telegram Package Bot")
     logger.info("DB path: %s", DB_PATH)
+    logger.info("HTTP port: %d", PORT)
+    logger.info("GROUP_CHAT_ID env: %s", GROUP_CHAT_ID_ENV or "(not set - use /start first)")
     logger.info("Reminder interval: every %d hours", REMINDER_INTERVAL_SECONDS // 3600)
     logger.info("=" * 60)
 
     init_db()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Build Telegram application
+    _app = Application.builder().token(BOT_TOKEN).build()
 
-    # Error handler must be first
-    app.add_error_handler(error_handler)
+    _app.add_error_handler(error_handler)
 
-    # Commands
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("help",    cmd_help))
-    app.add_handler(CommandHandler("pending", cmd_pending))
-    app.add_handler(CommandHandler("all",     cmd_all))
-    app.add_handler(CommandHandler("add",     cmd_add))
-    app.add_handler(CommandHandler("remind",  cmd_remind))
-    app.add_handler(CommandHandler("stats",   cmd_stats))
+    _app.add_handler(CommandHandler("start",   cmd_start))
+    _app.add_handler(CommandHandler("help",    cmd_help))
+    _app.add_handler(CommandHandler("pending", cmd_pending))
+    _app.add_handler(CommandHandler("all",     cmd_all))
+    _app.add_handler(CommandHandler("add",     cmd_add))
+    _app.add_handler(CommandHandler("remind",  cmd_remind))
+    _app.add_handler(CommandHandler("stats",   cmd_stats))
+    _app.add_handler(CallbackQueryHandler(handle_callback))
+    _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_sms_message))
 
-    # Inline button callbacks
-    app.add_handler(CallbackQueryHandler(handle_callback))
-
-    # Plain-text messages (SMS forwarded from Tasker)
-    # In groups: only fires when Group Privacy is OFF in BotFather
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_sms_message))
-
-    # Scheduled reminder every 3 days
-    app.job_queue.run_repeating(
+    _app.job_queue.run_repeating(
         scheduled_reminder,
         interval=REMINDER_INTERVAL_SECONDS,
         first=60,
         name="package_reminder",
     )
 
-    logger.info("All handlers registered. Starting polling...")
-    logger.info("NOTE: For the bot to read plain messages in groups,")
-    logger.info("  Group Privacy must be OFF.")
-    logger.info("  BotFather -> /mybots -> Bot Settings -> Group Privacy -> Turn off")
+    # Build and start HTTP server
+    web_app = build_web_app()
+    runner = await run_web_server(web_app)
 
-    app.run_polling(
+    # Start Telegram polling
+    await _app.initialize()
+    await _app.start()
+    await _app.updater.start_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
     )
+
+    logger.info("Bot is running. Press Ctrl+C to stop.")
+
+    # Keep running until interrupted
+    try:
+        await asyncio.Event().wait()
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        logger.info("Shutting down...")
+        await _app.updater.stop()
+        await _app.stop()
+        await _app.shutdown()
+        await runner.cleanup()
+
+
+def main():
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":
