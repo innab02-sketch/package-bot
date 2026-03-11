@@ -14,6 +14,7 @@ Environment variables:
 """
 
 import asyncio
+import json
 import logging
 import sqlite3
 import os
@@ -22,6 +23,7 @@ import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import parse_qs
 
 from aiohttp import web
 
@@ -254,25 +256,66 @@ async def process_sms_and_notify(sms_text: str, chat_id: int, sender_label: str 
 async def handle_sms_api(request: web.Request) -> web.Response:
     """
     POST /api/sms
-    Accepts JSON:  {"text": "...", "sender": "...", "chat_id": -123}
-    Or form data:  text=...&sender=...&chat_id=...
+    Accepts ANY of:
+      - JSON body:            {"text": "...", "sender": "...", "chat_id": -123}
+      - Form-urlencoded body: text=...&sender=...&chat_id=...
+      - Query string:         /api/sms?text=...&chat_id=...
+      - Raw plain-text body:  entire body treated as SMS text
 
     'chat_id' is optional - falls back to GROUP_CHAT_ID env var or first registered chat.
     'sender' is optional.
     """
     try:
-        content_type = request.content_type or ""
-        if "application/json" in content_type:
-            data = await request.json()
-        else:
-            # form-encoded or plain POST
-            data = await request.post()
-            data = dict(data)
+        content_type = (request.content_type or "").lower()
 
-        sms_text = data.get("text", "").strip()
-        sender_label = data.get("sender", "").strip()
+        # Read raw body once
+        raw_bytes = await request.read()
+        raw_body = raw_bytes.decode("utf-8", errors="replace").strip()
+
+        logger.info(
+            "[/api/sms] Incoming request | method=%s | content_type='%s' | body='%s'",
+            request.method, content_type, raw_body[:300]
+        )
+
+        data = {}
+
+        # Strategy 1: JSON
+        if "application/json" in content_type and raw_body:
+            try:
+                data = json.loads(raw_body)
+                logger.info("[/api/sms] Parsed as JSON")
+            except Exception as je:
+                logger.warning("[/api/sms] JSON parse failed: %s", je)
+
+        # Strategy 2: form-urlencoded (Tasker default)
+        if not data and raw_body:
+            try:
+                parsed = parse_qs(raw_body, keep_blank_values=True)
+                if parsed:
+                    data = {k: v[0] for k, v in parsed.items()}
+                    logger.info("[/api/sms] Parsed as form-urlencoded: %s", data)
+            except Exception as fe:
+                logger.warning("[/api/sms] form-urlencoded parse failed: %s", fe)
+
+        # Strategy 3: merge query-string params
+        qs_params = dict(request.rel_url.query)
+        if qs_params:
+            logger.info("[/api/sms] Query params: %s", qs_params)
+            for k, v in qs_params.items():
+                if k not in data:
+                    data[k] = v
+
+        # Strategy 4: raw body as text fallback
+        sms_text = str(data.get("text", "")).strip()
+        if not sms_text and raw_body:
+            # Use entire raw body as the SMS text
+            sms_text = raw_body
+            logger.info("[/api/sms] Using raw body as SMS text")
+
+        sender_label = str(data.get("sender", "")).strip()
 
         if not sms_text:
+            logger.warning("[/api/sms] Empty text. data=%s raw='%s'", data, raw_body[:100])
             return web.json_response(
                 {"ok": False, "error": "Missing 'text' field"}, status=400
             )
@@ -281,10 +324,10 @@ async def handle_sms_api(request: web.Request) -> web.Response:
         raw_chat = data.get("chat_id")
         if raw_chat:
             try:
-                chat_id = int(raw_chat)
+                chat_id = int(str(raw_chat).strip())
             except (ValueError, TypeError):
                 return web.json_response(
-                    {"ok": False, "error": "Invalid chat_id"}, status=400
+                    {"ok": False, "error": f"Invalid chat_id: {raw_chat}"}, status=400
                 )
         else:
             chat_id = get_primary_chat_id()
@@ -305,7 +348,7 @@ async def handle_sms_api(request: web.Request) -> web.Response:
         add_authorized_chat(chat_id)
 
         logger.info(
-            "[/api/sms] Received SMS for chat %s | sender='%s' | text='%s'",
+            "[/api/sms] Processing | chat=%s | sender='%s' | text='%s'",
             chat_id, sender_label, sms_text[:80],
         )
 
@@ -316,7 +359,7 @@ async def handle_sms_api(request: web.Request) -> web.Response:
         )
 
     except Exception as e:
-        logger.error("[/api/sms] Error: %s", e, exc_info=True)
+        logger.error("[/api/sms] Unhandled error: %s", e, exc_info=True)
         return web.json_response({"ok": False, "error": str(e)}, status=500)
 
 
