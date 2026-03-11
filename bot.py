@@ -190,6 +190,32 @@ def get_primary_chat_id():
     return chats[0] if chats else None
 
 
+# ─── Keyword filter ──────────────────────────────────────────────────────────
+
+# Only SMS messages containing at least one of these keywords will be processed.
+# Multi-word phrases are checked as substrings (case-insensitive).
+PACKAGE_KEYWORDS = [
+    "חבילה",
+    "משלוח",
+    "איסוף",
+    "delivery",
+    "package",
+    "shipment",
+    "הזמנה",
+    "דואר",
+    "parcel",
+    "pickup",
+    "ממתין לאיסוף",
+    "cn",
+]
+
+
+def is_package_sms(text: str) -> bool:
+    """Return True if the text contains at least one package-related keyword."""
+    lower = text.lower()
+    return any(kw in lower for kw in PACKAGE_KEYWORDS)
+
+
 # ─── SMS processing (shared logic) ───────────────────────────────────────────
 
 def extract_tracking_info(text):
@@ -346,6 +372,17 @@ async def handle_sms_api(request: web.Request) -> web.Response:
 
         # Register the chat if not already known
         add_authorized_chat(chat_id)
+
+        # Keyword filter — silently ignore non-package messages
+        if not is_package_sms(sms_text):
+            logger.info(
+                "[/api/sms] Filtered out (no package keywords) | chat=%s | text='%s'",
+                chat_id, sms_text[:80]
+            )
+            return web.json_response(
+                {"ok": True, "filtered": True,
+                 "reason": "No package keywords found in SMS text"}
+            )
 
         logger.info(
             "[/api/sms] Processing | chat=%s | sender='%s' | text='%s'",
@@ -522,8 +559,7 @@ async def handle_sms_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     logger.info("[msg_handler] chat_id=%s text='%s'", chat_id, text[:60])
 
-    package_keywords = ["חבילה", "משלוח", "delivery", "package", "shipment", "הזמנה", "דואר"]
-    if not any(kw in text.lower() for kw in package_keywords):
+    if not is_package_sms(text):
         logger.info("[msg_handler] No package keywords - ignoring")
         return
 
