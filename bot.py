@@ -192,28 +192,58 @@ def get_primary_chat_id():
 
 # ─── Keyword filter ──────────────────────────────────────────────────────────
 
-# Only SMS messages containing at least one of these keywords will be processed.
-# Multi-word phrases are checked as substrings (case-insensitive).
+# Strong keywords that unambiguously indicate a package/delivery SMS.
+# "הזמנה" and "דואר" were intentionally removed - too generic (match restaurants, etc.).
+# Multi-word phrases are matched as substrings (case-insensitive).
 PACKAGE_KEYWORDS = [
+    # Hebrew delivery terms
     "חבילה",
     "משלוח",
-    "איסוף",
+    "ממתין לאיסוף",
+    "שליחויות",
+    "דואר ישראל",
+    "צ'יטה",
+    # English delivery terms
     "delivery",
     "package",
     "shipment",
-    "הזמנה",
-    "דואר",
     "parcel",
     "pickup",
-    "ממתין לאיסוף",
-    "cn",
+    "tracking",
+    # Courier / delivery company names
+    "cheetah",
+    "dhl",
+    "fedex",
+    "ups",
+    "israel post",
+    "iherb",
+    "wolt",
 ]
+
+# "איסוף" alone is too generic; only match it when preceded by package-context words.
+# "CN" is only meaningful when immediately followed by digits (e.g. CN100405980).
+_CN_PATTERN = re.compile(r'\bCN\d+', re.IGNORECASE)
+_ISUF_CONTEXT = re.compile(
+    r'(?:חבילה|משלוח|parcel|package|shipment|delivery|דואר ישראל|שליחויות)'
+    r'.{0,60}איסוף'
+    r'|איסוף.{0,60}(?:חבילה|משלוח|parcel|package|shipment|delivery|דואר ישראל|שליחויות)',
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def is_package_sms(text: str) -> bool:
-    """Return True if the text contains at least one package-related keyword."""
+    """Return True if the text is clearly a package/delivery notification."""
     lower = text.lower()
-    return any(kw in lower for kw in PACKAGE_KEYWORDS)
+    # Check plain keyword list first (fast path)
+    if any(kw in lower for kw in PACKAGE_KEYWORDS):
+        return True
+    # "ממתין לאיסוף" is already in PACKAGE_KEYWORDS; also check bare "איסוף" in context
+    if "איסוף" in lower and _ISUF_CONTEXT.search(text):
+        return True
+    # CN followed by digits
+    if _CN_PATTERN.search(text):
+        return True
+    return False
 
 
 # ─── SMS processing (shared logic) ───────────────────────────────────────────
