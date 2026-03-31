@@ -164,8 +164,13 @@ def add_authorized_chat(chat_id: int, chat_title: str = ""):
 MARKETING_KEYWORDS = [
     "קנו", "קנייה", "קישור לרכישה", "לרכישה",
     "מבצע", "הנחה", "קופון", "מתנה", "בתוקף עד",
-    "לחצו כאן", "לחץ כאן", "http://", "https://",
+    "לחצו כאן", "לחץ כאן",
     "קנה עכשיו", "קנו עכשיו", "shop", "store",
+]
+
+# דפוסי קניות מוכרים — אם ה-URL מצביע לאחד מהם, זו הודעה שיווקית
+MARKETING_URL_PATTERNS = [
+    re.compile(r'https?://[^\s]*(?:shop|store|buy|cart|checkout|order|newshop|sale|deal)[^\s]*', re.IGNORECASE),
 ]
 
 # מילות מפתח חזקות — מספיק אחת מהן כדי לאשר שזו הודעת חבילה
@@ -173,13 +178,19 @@ STRONG_KEYWORDS = [
     "חבילה ממתינה", "חבילה הגיעה", "ממתין לאיסוף",
     "נמצאת בנקודת איסוף", "נמצא בנקודת איסוף",
     "מוכנה לאיסוף", "מוכן לאיסוף",
+    "נקודת החלוקה",
     "הזמנתכם", "הזמנתך", "לאסוף את ההזמנה",
-    "קוד אימות מסירה", "קוד מסירה",
-    "tms",
+    "קוד אימות מסירה", "קוד מסירה", "קוד לקבלת החבילה",
+    "tms", "epost", "hfd",
     "tracking", "מספר מעקב",
     "נשלחה אליך", "נשלח אליך", "בדרך אליך", "נמסרה", "נמסר",
     "courier", "dhl", "fedex", "ups", "tnt",
     "צ'יטה", "דואר ישראל", "iherb",
+]
+
+# ביטויים רגולריים לזיהוי חזק נוסף (CMR + ספרות)
+STRONG_PATTERNS = [
+    re.compile(r'\bCMR\d+', re.IGNORECASE),  # CMR022712549659
 ]
 
 # מילות מפתח חלשות — צריך לפחות 2 מהן (ללא מילות שיווק) כדי לאשר
@@ -206,11 +217,21 @@ def is_delivery_sms(text: str) -> bool:
         if kw.lower() in lower:
             logger.info(f"הודעה נדחתה (שיווקית) — מילת מפתח: '{kw}'")
             return False
+    for url_pat in MARKETING_URL_PATTERNS:
+        if url_pat.search(text):
+            logger.info(f"הודעה נדחתה (קישור קניות) — '{url_pat.pattern}'")
+            return False
 
     # שלב 2 — מילת מפתח חזקה
     for kw in STRONG_KEYWORDS:
         if kw.lower() in lower:
             logger.info(f"הודעה אושרה (מילה חזקה: '{kw}')")
+            return True
+
+    # שלב 2ב — ביטוי רגולרי חזק (CMR + ספרות)
+    for pattern in STRONG_PATTERNS:
+        if pattern.search(text):
+            logger.info(f"הודעה אושרה (ביטוי רגולרי: '{pattern.pattern}')")
             return True
 
     # שלב 3 — לפחות 2 מילות מפתח חלשות
